@@ -23,7 +23,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: v
         run: |
           VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
@@ -38,13 +38,13 @@ jobs:
     # Oldest supported Ubuntu = widest glibc compatibility for the AppImage.
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
       - run: cargo build --release --locked
-      - run: ./packaging/linux/build-appimage.sh "${{ needs.version.outputs.version }}"
-      - uses: actions/upload-artifact@v4
+      - run: bash packaging/linux/build-appimage.sh "${{ needs.version.outputs.version }}"
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: dist/*.AppImage
@@ -53,7 +53,7 @@ jobs:
     needs: version
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
@@ -61,20 +61,20 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/mdv.exe "dist/MDV-${{ needs.version.outputs.version }}-windows-x86_64.exe"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: dist/*.exe
 
   macos:
     needs: version
-    runs-on: macos-14
+    runs-on: macos-latest
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
       VERSION: ${{ needs.version.outputs.version }}
       BUNDLE_ID: io.github.${{ github.repository_owner }}.mdv
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -110,7 +110,7 @@ jobs:
           ln -s /Applications dist/dmg/Applications
           hdiutil create -volname MDV -srcfolder dist/dmg -ov -format UDZO \
             "dist/MDV-$VERSION-macos-universal.dmg"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: dist/*.dmg
@@ -120,12 +120,12 @@ jobs:
     needs: [version, linux, windows, macos]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
       - run: (cd dist && sha256sum * > SHA256SUMS.txt)
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           draft: true
           generate_release_notes: true

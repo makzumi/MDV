@@ -79,7 +79,7 @@ git push origin v0.1.0
 |---|---|---|
 | Linux | `MDV-<v>-x86_64.AppImage` | Ubuntu 22.04 (runs on glibc 2.35+ distros) |
 | Windows | `MDV-<v>-windows-x86_64.exe` (portable, icon embedded) | windows-latest |
-| macOS | `MDV-<v>-macos-universal.dmg` (Apple Silicon + Intel) | macos-14 |
+| macOS | `MDV-<v>-macos-universal.dmg` (Apple Silicon + Intel) | macos-latest |
 
 Build the AppImage locally (downloads `appimagetool` into `dist/`):
 
