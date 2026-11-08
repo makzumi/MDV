@@ -1,5 +1,6 @@
 use crate::doc::{Doc, Prefix};
-use crate::editor::{LiveEditor, SourceEditor, View};
+use crate::editor::{SourceEditor, View};
+use crate::live::{Format, LiveEditor};
 use crate::find::Find;
 use crate::images;
 use crate::theme::{COLUMN, Theme};
@@ -12,6 +13,32 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 
 const WELCOME: &str = include_str!("welcome.md");
+const TOOLBAR_ROW: f32 = 46.0;
+
+/// Block types offered in the heading menus.
+pub const HEADINGS: [(u8, &str, &str); 7] = [
+    (0, "Paragraph", icon::PARAGRAPH),
+    (1, "Heading 1", icon::TEXT_H_ONE),
+    (2, "Heading 2", icon::TEXT_H_TWO),
+    (3, "Heading 3", icon::TEXT_H_THREE),
+    (4, "Heading 4", icon::TEXT_H_FOUR),
+    (5, "Heading 5", icon::TEXT_H_FIVE),
+    (6, "Heading 6", icon::TEXT_H_SIX),
+];
+
+fn tb_btn(ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: bool, act: &mut Option<Action>, a: Action) {
+    let b = Button::new(RichText::new(glyph).size(17.0)).frame_when_inactive(false).min_size(egui::vec2(30.0, 30.0));
+    if ui.add_enabled(enabled, b).on_hover_text(tip).clicked() {
+        *act = Some(a);
+    }
+}
+
+fn tb_sep(ui: &mut egui::Ui, color: egui::Color32) {
+    ui.add_space(4.0);
+    let r = ui.allocate_exact_size(egui::vec2(1.0, 20.0), egui::Sense::hover()).0;
+    ui.painter().rect_filled(r, 0.0, color);
+    ui.add_space(4.0);
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -40,6 +67,8 @@ enum Action {
     FindNext,
     FindPrev,
     Image,
+    Color(Option<&'static str>),
+    ClearFormat,
 }
 
 /// Something that would throw away unsaved changes.
@@ -63,6 +92,16 @@ enum DialogResult {
     Image(Option<PathBuf>),
 }
 
+/// State of the "Insert link" dialog.
+#[derive(Default)]
+struct LinkDialog {
+    url: String,
+    /// Link text, when there's no selection to turn into a link.
+    text: String,
+    has_selection: bool,
+    focus: bool,
+}
+
 /// State of the "Insert image" dialog.
 #[derive(Default)]
 struct ImageDialog {
@@ -84,6 +123,11 @@ pub struct App {
     status: Option<String>,
     find: Find,
     image_dialog: Option<ImageDialog>,
+    link_dialog: Option<LinkDialog>,
+    /// Toolbar measurements from the previous frame (for its responsive layout).
+    tb_fmt_w: f32,
+    tb_right_w: f32,
+    tb_h: f32,
 }
 
 impl App {
@@ -107,6 +151,10 @@ impl App {
             status: None,
             find: Find::default(),
             image_dialog: None,
+            link_dialog: None,
+            tb_fmt_w: 600.0,
+            tb_right_w: 260.0,
+            tb_h: TOOLBAR_ROW,
         };
         if let Some(p) = path {
             app.load(p);
@@ -114,8 +162,12 @@ impl App {
         // Debug builds only: start in a given state (used for screenshots).
         #[cfg(debug_assertions)]
         {
-            if let Some(at) = std::env::var("MDV_DEV_CARET").ok().and_then(|v| v.parse().ok()) {
-                app.doc.sel = crate::doc::Sel::caret(at);
+            // MDV_DEV_CARET=40 or MDV_DEV_CARET=20,200 (a selection).
+            if let Ok(v) = std::env::var("MDV_DEV_CARET") {
+                let mut it = v.split(',').filter_map(|x| x.trim().parse().ok());
+                let a = it.next().unwrap_or(0);
+                let b = it.next().unwrap_or(a);
+                app.doc.sel = crate::doc::Sel { anchor: a, head: b };
                 app.live.editing = true;
                 app.live.focus_next = true;
             }
@@ -278,6 +330,7 @@ impl App {
                 | Action::FindNext
                 | Action::FindPrev
                 | Action::Image
+                | Action::Link
         );
         match a {
             Action::Undo => self.doc.undo(),
@@ -285,8 +338,16 @@ impl App {
             Action::Heading(l) => self.doc.set_heading(l),
             Action::Prefix(p) => self.doc.toggle_prefix(p),
             Action::CodeBlock => self.doc.insert_code_block(),
+            // In the editor, Ctrl+B with nothing selected formats what you type next.
+            Action::Wrap(m) if self.mode == Mode::Live && self.doc.sel.is_empty() => self.live.set_pending(m),
             Action::Wrap(m) => self.doc.toggle_wrap(m),
-            Action::Link => self.doc.insert_link(),
+            Action::Link => {
+                self.link_dialog = Some(LinkDialog {
+                    has_selection: !self.doc.sel.is_empty(),
+                    focus: true,
+                    ..Default::default()
+                })
+            }
             Action::Rule => self.doc.insert_rule(),
             Action::ToggleMode => {
                 // The selection lives in `Doc`, so the caret carries across views.
@@ -310,6 +371,15 @@ impl App {
                 self.find.step(&mut self.doc, a == Action::FindNext);
             }
             Action::Image => self.image_dialog = Some(ImageDialog { focus: true, ..Default::default() }),
+            // With nothing selected in the editor, colors what you type next.
+            Action::Color(c) if self.doc.sel.is_empty() => {
+                if self.mode == Mode::Live {
+                    self.live.set_pending_color(c);
+                }
+            }
+            Action::Color(c) => self.doc.set_color(c),
+            Action::ClearFormat if self.doc.sel.is_empty() => self.live.clear_pending(),
+            Action::ClearFormat => self.doc.clear_formatting(),
         }
         if edits {
             // Keep (or put) the caret in an editor so the user can keep typing.
@@ -327,7 +397,7 @@ impl App {
         let c = Modifiers::COMMAND;
         let cs = Modifiers::COMMAND | Modifiers::SHIFT;
         // Order matters: Shift variants first (egui ignores extra Shift otherwise).
-        let table: [(Modifiers, Key, Action); 21] = [
+        let table: [(Modifiers, Key, Action); 25] = [
             (cs, Key::Z, Action::Redo),
             (c, Key::Z, Action::Undo),
             (c, Key::Y, Action::Redo),
@@ -344,6 +414,10 @@ impl App {
             (c, Key::Num1, Action::Heading(1)),
             (c, Key::Num2, Action::Heading(2)),
             (c, Key::Num3, Action::Heading(3)),
+            (c, Key::Num4, Action::Heading(4)),
+            (c, Key::Num5, Action::Heading(5)),
+            (c, Key::Num6, Action::Heading(6)),
+            (c, Key::Backslash, Action::ClearFormat),
             (c, Key::Slash, Action::ToggleMode),
             (c, Key::F, Action::Find),
             (c, Key::H, Action::Replace),
@@ -359,86 +433,113 @@ impl App {
         })
     }
 
+    /// The main toolbar. Lays itself out for the available width: formatting
+    /// centered with controls on the right; or both left-aligned; or, when
+    /// narrow, formatting wrapped over several lines with controls below.
     fn toolbar(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let mut act = None;
-        let t = self.theme;
-        let btn = |ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: bool, act: &mut Option<Action>, a: Action| {
-            let b = Button::new(RichText::new(glyph).size(17.0)).frame_when_inactive(false).min_size(egui::vec2(30.0, 30.0));
-            if ui.add_enabled(enabled, b).on_hover_text(tip).clicked() {
-                *act = Some(a);
-            }
-        };
-        let sep = |ui: &mut egui::Ui| {
-            ui.add_space(4.0);
-            let r = ui.allocate_exact_size(egui::vec2(1.0, 20.0), egui::Sense::hover()).0;
-            ui.painter().rect_filled(r, 0.0, t.border);
-            ui.add_space(4.0);
-        };
+        let avail = ui.available_width();
+        let (fw, rw) = (self.tb_fmt_w, self.tb_right_w);
+        let row = egui::vec2(avail, TOOLBAR_ROW);
+        let top = ui.cursor().top();
 
-        // Formatting group, centered (fixed button widths make it measurable).
-        let group_w = 16.0 * 32.0 + 5.0 * 11.0;
-        ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            let full = ui.available_width();
-            ui.add_space(((full - group_w) / 2.0).max(0.0));
-
-            btn(ui, icon::ARROW_U_UP_LEFT, "Undo (Ctrl+Z)", self.doc.can_undo(), &mut act, Action::Undo);
-            btn(ui, icon::ARROW_U_UP_RIGHT, "Redo (Ctrl+Shift+Z)", self.doc.can_redo(), &mut act, Action::Redo);
-            sep(ui);
-            ui.menu_button(RichText::new(format!("{}{}", icon::TEXT_H, icon::CARET_DOWN)).size(17.0), |ui| {
-                ui.set_min_width(150.0);
-                for (lvl, name, glyph) in [
-                    (0u8, "Paragraph", icon::PARAGRAPH),
-                    (1, "Heading 1", icon::TEXT_H_ONE),
-                    (2, "Heading 2", icon::TEXT_H_TWO),
-                    (3, "Heading 3", icon::TEXT_H_THREE),
-                ] {
-                    if ui.button(format!("{glyph}  {name}")).clicked() {
-                        act = Some(Action::Heading(lvl));
-                    }
-                }
-            })
-            .response
-            .on_hover_text("Heading (Ctrl+0…3)");
-            btn(ui, icon::LIST_BULLETS, "Bullet list", true, &mut act, Action::Prefix(Prefix::Bullet));
-            btn(ui, icon::LIST_NUMBERS, "Numbered list", true, &mut act, Action::Prefix(Prefix::Number));
-            btn(ui, icon::LIST_CHECKS, "Task list", true, &mut act, Action::Prefix(Prefix::Task));
-            sep(ui);
-            btn(ui, icon::QUOTES, "Quote", true, &mut act, Action::Prefix(Prefix::Quote));
-            btn(ui, icon::CODE_BLOCK, "Code block", true, &mut act, Action::CodeBlock);
-            btn(ui, icon::MINUS, "Divider", true, &mut act, Action::Rule);
-            sep(ui);
-            btn(ui, icon::TEXT_B, "Bold (Ctrl+B)", true, &mut act, Action::Wrap("**"));
-            btn(ui, icon::TEXT_ITALIC, "Italic (Ctrl+I)", true, &mut act, Action::Wrap("*"));
-            btn(ui, icon::TEXT_STRIKETHROUGH, "Strikethrough (Ctrl+Shift+X)", true, &mut act, Action::Wrap("~~"));
-            btn(ui, icon::CODE, "Inline code (Ctrl+E)", true, &mut act, Action::Wrap("`"));
-            btn(ui, icon::LINK, "Link (Ctrl+K)", true, &mut act, Action::Link);
-            btn(ui, icon::IMAGE, "Insert image", true, &mut act, Action::Image);
-
-            // Right-aligned: file + view controls.
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if avail >= fw + rw + 24.0 {
+            let centered = avail >= fw + 2.0 * rw + 32.0;
+            ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                let theme_icon = if t.dark { icon::SUN } else { icon::MOON };
-                btn(ui, theme_icon, "Toggle theme", true, &mut act, Action::ToggleTheme);
-                btn(ui, icon::MAGNIFYING_GLASS, "Find & replace (Ctrl+F / Ctrl+H)", true, &mut act, Action::Find);
-
-                let (glyph, label, tip) = match self.mode {
-                    Mode::Live => (icon::CODE, "Source", "View markdown source (Ctrl+/)"),
-                    Mode::Source => (icon::TEXT_AA, "Editor", "Back to the editor (Ctrl+/)"),
-                };
-                let toggle = Button::new(RichText::new(format!("{glyph}  {label}")).size(14.0))
-                    .selected(self.mode == Mode::Source)
-                    .min_size(egui::vec2(0.0, 30.0));
-                if ui.add(toggle).on_hover_text(tip).clicked() {
-                    act = Some(Action::ToggleMode);
-                }
-                sep(ui);
-                btn(ui, icon::FLOPPY_DISK, "Save (Ctrl+S)", true, &mut act, Action::Save);
-                btn(ui, icon::FOLDER_OPEN, "Open (Ctrl+O)", true, &mut act, Action::Open);
-                btn(ui, icon::FILE_PLUS, "New (Ctrl+N)", true, &mut act, Action::New);
+                let lead = if centered { ((avail - fw) / 2.0).max(0.0) } else { 0.0 };
+                ui.add_space(lead);
+                self.tb_fmt_w = self.fmt_group(ui, &mut act);
+                ui.add_space((avail - lead - self.tb_fmt_w - rw - 4.0).max(0.0));
+                self.tb_right_w = self.right_group(ui, &mut act);
             });
-        });
+        } else {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(2.0, 4.0);
+                self.fmt_group(ui, &mut act);
+            });
+            ui.allocate_ui_with_layout(egui::vec2(avail, 40.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.add_space((avail - rw - 4.0).max(0.0));
+                self.tb_right_w = self.right_group(ui, &mut act);
+            });
+        }
+
+        let h = (ui.cursor().top() - top).max(TOOLBAR_ROW);
+        if (h - self.tb_h).abs() > 0.5 {
+            self.tb_h = h;
+            ui.ctx().request_repaint();
+        }
         act
+    }
+
+    /// Formatting buttons. Returns their total width.
+    fn fmt_group(&self, ui: &mut egui::Ui, act: &mut Option<Action>) -> f32 {
+        let t = self.theme;
+        let x0 = ui.cursor().left();
+        tb_btn(ui, icon::ARROW_U_UP_LEFT, "Undo (Ctrl+Z)", self.doc.can_undo(), act, Action::Undo);
+        tb_btn(ui, icon::ARROW_U_UP_RIGHT, "Redo (Ctrl+Shift+Z)", self.doc.can_redo(), act, Action::Redo);
+        tb_sep(ui, t.border);
+        ui.menu_button(RichText::new(format!("{}{}", icon::TEXT_H, icon::CARET_DOWN)).size(17.0), |ui| {
+            ui.set_min_width(150.0);
+            for (lvl, name, glyph) in HEADINGS {
+                if ui.button(format!("{glyph}  {name}")).clicked() {
+                    *act = Some(Action::Heading(lvl));
+                }
+            }
+        })
+        .response
+        .on_hover_text("Heading (Ctrl+0…6)");
+        tb_btn(ui, icon::LIST_BULLETS, "Bullet list", true, act, Action::Prefix(Prefix::Bullet));
+        tb_btn(ui, icon::LIST_NUMBERS, "Numbered list", true, act, Action::Prefix(Prefix::Number));
+        tb_btn(ui, icon::LIST_CHECKS, "Task list", true, act, Action::Prefix(Prefix::Task));
+        tb_sep(ui, t.border);
+        tb_btn(ui, icon::QUOTES, "Quote", true, act, Action::Prefix(Prefix::Quote));
+        tb_btn(ui, icon::CODE_BLOCK, "Code block", true, act, Action::CodeBlock);
+        tb_btn(ui, icon::MINUS, "Divider", true, act, Action::Rule);
+        tb_sep(ui, t.border);
+        tb_btn(ui, icon::TEXT_B, "Bold (Ctrl+B)", true, act, Action::Wrap("**"));
+        tb_btn(ui, icon::TEXT_ITALIC, "Italic (Ctrl+I)", true, act, Action::Wrap("*"));
+        tb_btn(ui, icon::TEXT_STRIKETHROUGH, "Strikethrough (Ctrl+Shift+X)", true, act, Action::Wrap("~~"));
+        tb_btn(ui, icon::CODE, "Inline code (Ctrl+E)", true, act, Action::Wrap("`"));
+        tb_btn(ui, icon::LINK, "Link (Ctrl+K)", true, act, Action::Link);
+        tb_btn(ui, icon::IMAGE, "Insert image", true, act, Action::Image);
+        tb_sep(ui, t.border);
+        ui.menu_button(RichText::new(icon::TEXT_A_UNDERLINE).size(17.0), |ui| {
+            if let Some(c) = crate::live::color_picker(ui, &t, None) {
+                *act = Some(Action::Color(c));
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text("Text color");
+        tb_btn(ui, icon::TEXT_T_SLASH, "Clear formatting (Ctrl+\\)", true, act, Action::ClearFormat);
+        ui.cursor().left() - x0
+    }
+
+    /// File and view controls. Returns their total width.
+    fn right_group(&self, ui: &mut egui::Ui, act: &mut Option<Action>) -> f32 {
+        let t = self.theme;
+        let x0 = ui.cursor().left();
+        tb_btn(ui, icon::FILE_PLUS, "New (Ctrl+N)", true, act, Action::New);
+        tb_btn(ui, icon::FOLDER_OPEN, "Open (Ctrl+O)", true, act, Action::Open);
+        tb_btn(ui, icon::FLOPPY_DISK, "Save (Ctrl+S)", true, act, Action::Save);
+        tb_sep(ui, t.border);
+        let (glyph, label, tip) = match self.mode {
+            Mode::Live => (icon::CODE, "Source", "View markdown source (Ctrl+/)"),
+            Mode::Source => (icon::TEXT_AA, "Editor", "Back to the editor (Ctrl+/)"),
+        };
+        let toggle = Button::new(RichText::new(format!("{glyph}  {label}")).size(14.0))
+            .selected(self.mode == Mode::Source)
+            .min_size(egui::vec2(0.0, 30.0));
+        if ui.add(toggle).on_hover_text(tip).clicked() {
+            *act = Some(Action::ToggleMode);
+        }
+        tb_btn(ui, icon::MAGNIFYING_GLASS, "Find & replace (Ctrl+F / Ctrl+H)", true, act, Action::Find);
+        let theme_icon = if t.dark { icon::SUN } else { icon::MOON };
+        tb_btn(ui, theme_icon, "Toggle theme", true, act, Action::ToggleTheme);
+        ui.cursor().left() - x0
     }
 
     fn image_dialog(&mut self, ctx: &egui::Context) {
@@ -488,6 +589,50 @@ impl App {
             }
         } else if cancel {
             self.image_dialog = None;
+        }
+    }
+
+    fn link_dialog(&mut self, ctx: &egui::Context) {
+        let Some(d) = &mut self.link_dialog else { return };
+        let (mut insert, mut cancel) = (false, false);
+        let faint = self.theme.faint;
+        egui::Modal::new(egui::Id::new("insert-link")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(RichText::new("Insert link").size(17.0).strong());
+            ui.add_space(10.0);
+            ui.label(RichText::new("URL").color(faint));
+            let r = ui.add(egui::TextEdit::singleline(&mut d.url).hint_text("https://…").desired_width(f32::INFINITY));
+            if std::mem::take(&mut d.focus) {
+                r.request_focus();
+            }
+            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                insert = true;
+            }
+            if !d.has_selection {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Text").color(faint));
+                ui.add(egui::TextEdit::singleline(&mut d.text).hint_text("Optional").desired_width(f32::INFINITY));
+            }
+            ui.add_space(14.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add_enabled(!d.url.trim().is_empty(), Button::new("  Insert  ")).clicked() {
+                    insert = true;
+                }
+                if ui.button("  Cancel  ").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                    cancel = true;
+                }
+            });
+        });
+        if insert && let Some(d) = self.link_dialog.take() {
+            let url = d.url.trim();
+            if !url.is_empty() {
+                let url = if url.contains([' ', '(', ')']) { format!("<{url}>") } else { url.to_owned() };
+                self.doc.wrap_link(&url, d.text.trim());
+                self.live.focus_next = self.mode == Mode::Live;
+                self.source.focus_next = self.mode == Mode::Source;
+            }
+        } else if cancel {
+            self.link_dialog = None;
         }
     }
 
@@ -551,7 +696,7 @@ impl eframe::App for App {
             }
         }
 
-        if self.confirm.is_none() && self.image_dialog.is_none() {
+        if self.confirm.is_none() && self.image_dialog.is_none() && self.link_dialog.is_none() {
             for a in self.shortcuts(&ctx) {
                 self.apply(&ctx, a);
             }
@@ -565,7 +710,7 @@ impl eframe::App for App {
 
         let t = self.theme;
         let toolbar_action = egui::Panel::top("toolbar")
-            .exact_size(46.0)
+            .exact_size(self.tb_h)
             .frame(Frame::NONE.fill(t.bg).inner_margin(Margin::symmetric(10, 0)))
             .show_separator_line(true)
             .show(ui, |ui| self.toolbar(ui))
@@ -630,7 +775,130 @@ impl eframe::App for App {
         if let Some(a) = toolbar_action {
             self.apply(&ctx, a);
         }
+        // Floating selection toolbar in the editor.
+        if let Some(f) = self.live.format.take() {
+            let a = match f {
+                Format::Heading(l) => Action::Heading(l),
+                Format::Prefix(p) => Action::Prefix(p),
+                Format::Wrap(m) => Action::Wrap(m),
+                Format::Link => Action::Link,
+                Format::Color(c) => Action::Color(c),
+                Format::Clear => Action::ClearFormat,
+            };
+            self.apply(&ctx, a);
+        }
         self.image_dialog(&ctx);
+        self.link_dialog(&ctx);
         self.confirm_dialog(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+
+    /// The whole app on the welcome document, "Features" heading selected
+    /// (`sel` is relative to the start of the word) and the editor focused.
+    fn app_at_features(sel: (usize, usize)) -> (Harness<'static, App>, usize) {
+        let mut h = Harness::builder().with_size(egui::vec2(1100.0, 800.0)).build_eframe(|cc| App::new(cc, None));
+        h.run();
+        let a = h.state().doc.text.find("Features").unwrap();
+        let s = h.state_mut();
+        s.doc.sel = crate::doc::Sel { anchor: a + sel.0, head: a + sel.1 };
+        s.live.focus_next = true;
+        h.run();
+        (h, a)
+    }
+
+    fn assert_heading_restored(h: &Harness<'static, App>, a: usize, how: &str) {
+        let t = &h.state().doc.text;
+        assert_eq!(&t[a - 5..a + 10], "\n\n## Features\n\n", "{how}: source");
+        let rows = h.state().live.row_texts();
+        assert!(rows.iter().any(|r| r == "Features"), "{how}: rendered rows {rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("##")), "{how}: markdown leaked into the view {rows:?}");
+    }
+
+    #[test]
+    fn heading_to_text_and_back_via_floating_toolbar() {
+        let (mut h, a) = app_at_features((0, 8));
+        for (open, pick) in [("Heading 2  ", "Text"), ("Text  ", "Heading 2")] {
+            h.get_by_label_contains(open).click();
+            h.run();
+            h.get_by_label_contains(pick).click();
+            h.run();
+        }
+        assert_heading_restored(&h, a, "floating toolbar");
+    }
+
+    /// A human click: press and release in separate frames.
+    fn slow_click(h: &mut Harness<'static, App>, label: &str) {
+        // If the label is in both toolbars, take the floating one (lowest on screen).
+        let p = h
+            .get_all_by_label_contains(label)
+            .map(|n| n.rect())
+            .max_by(|a, b| a.top().total_cmp(&b.top()))
+            .expect("button not found")
+            .center();
+        // Fixed frame counts: while the editor is focused the caret blink keeps
+        // requesting frames, so `run()` would never settle.
+        h.hover_at(p);
+        h.run_steps(2);
+        h.drag_at(p);
+        // One frame held, like a quick human click. (`run()` would advance
+        // simulated time past egui's click duration: the caret blink keeps
+        // requesting frames.)
+        h.step();
+        h.event(egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(3);
+    }
+
+    #[test]
+    fn floating_toolbar_with_real_mouse_clicks() {
+        // Heading → Text → Heading 2, pressing and releasing in separate frames.
+        let (mut h, a) = app_at_features((0, 8));
+        for (open, pick) in [("Heading 2  ", "Text"), ("Text  ", "Heading 2")] {
+            slow_click(&mut h, open);
+            slow_click(&mut h, pick);
+        }
+        assert_heading_restored(&h, a, "slow clicks");
+
+        // The reported bug: after Text → Heading 2, Italic turned the line into
+        // `*## Features*` (the selection had grown to include "## ").
+        slow_click(&mut h, egui_phosphor::regular::TEXT_ITALIC);
+        let t = &h.state().doc.text;
+        assert_eq!(&t[a - 3..a + 10], "## *Features*", "italic after heading change keeps the heading");
+
+        // The reported bug: italic on selected heading text.
+        let (mut h, a) = app_at_features((0, 8));
+        slow_click(&mut h, egui_phosphor::regular::TEXT_ITALIC);
+        let t = &h.state().doc.text;
+        assert_eq!(&t[a - 3..a + 10], "## *Features*", "italic keeps the heading");
+        assert_eq!(&t[h.state().doc.sel.range()], "Features", "selection unchanged");
+    }
+
+    #[test]
+    fn heading_to_text_and_back_via_menu_and_keys() {
+        for (via_keys, sel) in [(false, (2, 2)), (false, (0, 8)), (true, (2, 2)), (true, (0, 8))] {
+            let (mut h, a) = app_at_features(sel);
+            for (lvl, key) in [(0u8, egui::Key::Num0), (2, egui::Key::Num2)] {
+                if via_keys {
+                    h.key_press_modifiers(egui::Modifiers::COMMAND, key);
+                } else {
+                    h.get_by_label(&format!("{}{}", icon::TEXT_H, icon::CARET_DOWN)).click();
+                    h.run();
+                    let name = if lvl == 0 { "Paragraph".to_owned() } else { format!("Heading {lvl}") };
+                    h.get_by_label_contains(&name).click();
+                }
+                h.run();
+            }
+            assert_heading_restored(&h, a, &format!("keys={via_keys} sel={sel:?}"));
+        }
     }
 }

@@ -2,12 +2,12 @@
 
 A **light, fast, native** markdown editor written in Rust. No browser engine, no webview — just your text, drawn on the GPU.
 
-Click anywhere to start editing. The block under your caret reveals its *markdown syntax*; everything else stays rendered.
+Click anywhere and start typing. Format with the toolbar or shortcuts, just like a word processor; MDV writes the markdown for you.
 
 ## Features
 
-- Inline editing with live formatting
-- Toggle the **Source** view with `Ctrl+/`
+- Edit like a normal document; no markdown syntax in your way
+- Want the raw markdown? Toggle the **Source** view with `Ctrl+/`
 - Undo / redo, smart lists, and ~~clutter~~ keyboard shortcuts
 - Open with `Ctrl+O`, save with `Ctrl+S`, or drop a file on the window
 - Insert images from the toolbar or by dropping them in, then click one to resize it

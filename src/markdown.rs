@@ -13,6 +13,74 @@ use crate::images::{self, ImageRef};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use std::ops::Range;
 
+/// Text colors offered by the color picker: mid-tones that read on both the
+/// dark and light theme. Stored as `<span style="color: #hex">`.
+pub const COLORS: [(&str, &str); 8] = [
+    ("Red", "#e5484d"),
+    ("Orange", "#f76b15"),
+    ("Yellow", "#d4a106"),
+    ("Green", "#30a46c"),
+    ("Teal", "#12a594"),
+    ("Blue", "#3e7bfa"),
+    ("Purple", "#8e4ec6"),
+    ("Pink", "#d6409f"),
+];
+
+pub fn color_open_tag(hex: &str) -> String {
+    format!("<span style=\"color: {hex}\">")
+}
+
+/// Parse a CSS color: `#rgb`, `#rrggbb`, or a few common names.
+pub fn parse_color(v: &str) -> Option<[u8; 3]> {
+    let v = v.trim().to_ascii_lowercase();
+    if let Some(h) = v.strip_prefix('#') {
+        let h: String = if h.len() == 3 { h.chars().flat_map(|c| [c, c]).collect() } else { h.to_owned() };
+        if h.len() == 6 {
+            let n = u32::from_str_radix(&h, 16).ok()?;
+            return Some([(n >> 16) as u8, (n >> 8) as u8, n as u8]);
+        }
+        return None;
+    }
+    Some(match v.as_str() {
+        "red" => [0xe5, 0x48, 0x4d],
+        "orange" => [0xf7, 0x6b, 0x15],
+        "yellow" | "gold" => [0xd4, 0xa1, 0x06],
+        "green" => [0x30, 0xa4, 0x6c],
+        "teal" => [0x12, 0xa5, 0x94],
+        "blue" => [0x3e, 0x7b, 0xfa],
+        "purple" => [0x8e, 0x4e, 0xc6],
+        "pink" => [0xd6, 0x40, 0x9f],
+        "gray" | "grey" => [0x8b, 0x8d, 0x98],
+        _ => return None,
+    })
+}
+
+/// For an inline tag: `Some(Some(color))` opens a colored span, `Some(None)`
+/// opens a plain `<span>`/`<font>`, and `None` means it's not a span opener.
+pub fn span_open_color(tag: &str) -> Option<Option<[u8; 3]>> {
+    let l = tag.trim().to_ascii_lowercase();
+    if !(l.starts_with("<span") || l.starts_with("<font")) || l.starts_with("</") {
+        return None;
+    }
+    let compact: String = l.chars().filter(|c| !c.is_whitespace()).collect();
+    let value = |key: &str| {
+        compact.find(key).map(|i| {
+            compact[i + key.len()..]
+                .trim_start_matches(['"', '\'', '='])
+                .split(['"', '\'', ';', '>'])
+                .next()
+                .unwrap_or("")
+                .to_owned()
+        })
+    };
+    Some(value("color:").or_else(|| value("color=")).and_then(|c| parse_color(&c)))
+}
+
+pub fn is_span_close(tag: &str) -> bool {
+    let l = tag.trim().to_ascii_lowercase();
+    l.starts_with("</span") || l.starts_with("</font")
+}
+
 pub fn options() -> Options {
     Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS
 }
@@ -42,6 +110,8 @@ pub struct Style {
     pub code: bool,
     pub html: bool,
     pub link: Option<String>,
+    /// From an enclosing `<span style="color: …">`.
+    pub color: Option<[u8; 3]>,
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +123,9 @@ pub struct Span {
     /// `true` if `text` is a verbatim copy of `source[src..src + text.len()]`,
     /// so each char maps exactly. Otherwise every char maps to `src`.
     pub exact: bool,
+    /// End of this span's source (exclusive). For non-exact spans, the chars
+    /// all map to `src..src_end` as a unit.
+    pub src_end: usize,
     /// Set for image spans (`text` is empty); drawn as a picture, not text.
     pub image: Option<Box<ImageRef>>,
 }
@@ -128,6 +201,8 @@ struct Builder<'a> {
     cur_image: Option<ImageRef>,
     html: bool,
     links: Vec<String>,
+    /// Open inline `<span>`/`<font>` tags and their colors.
+    colors: Vec<Option<[u8; 3]>>,
     lists: Vec<Option<u64>>,
     quote: usize,
 }
@@ -141,6 +216,7 @@ impl<'a> Builder<'a> {
             code: false,
             html: self.html,
             link: self.links.last().cloned(),
+            color: self.colors.iter().rev().find_map(|c| *c),
         }
     }
 
@@ -161,7 +237,9 @@ impl<'a> Builder<'a> {
 
     fn flush(&mut self) {
         if let Some(row) = self.row.take() {
-            let empty = matches!(row.kind, RowKind::Text) && row.spans.is_empty() && row.marker.is_none();
+            // Keep empty list items and headings: the caret can sit in them.
+            let empty =
+                matches!(row.kind, RowKind::Text) && row.spans.is_empty() && row.marker.is_none() && row.heading == 0;
             if !empty {
                 self.rows.push(row);
             }
@@ -176,12 +254,14 @@ impl<'a> Builder<'a> {
                 (range.start, exact)
             }
         };
-        self.push(Span { text, style, src, exact, image: None }, range.start);
+        let src_end = if exact { src + text.len() } else { range.end.max(src) };
+        self.push(Span { text, style, src, exact, src_end, image: None }, range.start);
     }
 
     fn push_image(&mut self, img: ImageRef) {
-        let src = img.range.start;
-        self.push(Span { text: String::new(), style: Style::default(), src, exact: false, image: Some(Box::new(img)) }, src);
+        let (src, src_end) = (img.range.start, img.range.end);
+        let span = Span { text: String::new(), style: Style::default(), src, exact: false, src_end, image: Some(Box::new(img)) };
+        self.push(span, src);
     }
 
     fn push(&mut self, span: Span, at: usize) {
@@ -328,8 +408,8 @@ impl<'a> Builder<'a> {
             }
             Event::Html(t) => self.html_chunk(&t, range, true),
             Event::InlineHtml(t) => self.html_chunk(&t, range, false),
-            Event::SoftBreak => self.push_span(" ".into(), self.style(), &(range.start..range.start), None),
-            Event::HardBreak => self.push_span("\n".into(), self.style(), &(range.start..range.start), None),
+            Event::SoftBreak => self.push_span(" ".into(), self.style(), &range, None),
+            Event::HardBreak => self.push_span("\n".into(), self.style(), &range, None),
             Event::TaskListMarker(checked) => {
                 if let Some(row) = &mut self.row {
                     row.marker = Some(Marker::Task { checked, at: range.start });
@@ -360,6 +440,15 @@ impl<'a> Builder<'a> {
                 row.center |= center;
             }
         } else if tags.is_empty() {
+            // Color spans style the text between them instead of showing.
+            if let Some(color) = span_open_color(t) {
+                self.colors.push(color);
+                return;
+            }
+            if is_span_close(t) {
+                self.colors.pop();
+                return;
+            }
             let style = Style { html: true, ..self.style() };
             self.push_span(t.to_owned(), style, &range, None);
             return;
@@ -440,6 +529,7 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
         cur_image: None,
         html: false,
         links: Vec::new(),
+        colors: Vec::new(),
         lists: Vec::new(),
         quote: 0,
     };
@@ -615,6 +705,20 @@ mod tests {
         assert!(b[1].rows.iter().flat_map(|r| &r.spans).all(|s| s.image.is_some()));
         let i = img(2);
         assert_eq!(&src[i[0].range.clone()], "<img src=\"c.png\" width=\"20\">");
+    }
+
+    #[test]
+    fn color_spans() {
+        let src = "a <span style=\"color: #e5484d\">red **bold**</span> b";
+        let spans = &parse_blocks(src)[0].rows[0].spans;
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "a red bold b", "tags are hidden");
+        let red = spans.iter().find(|s| s.text == "bold").unwrap();
+        assert_eq!(red.style.color, Some([0xe5, 0x48, 0x4d]));
+        assert!(red.style.bold);
+        assert_eq!(spans.last().unwrap().style.color, None);
+        assert_eq!(parse_color("#abc"), Some([0xaa, 0xbb, 0xcc]));
+        assert_eq!(span_open_color("<font color=\"blue\">"), Some(Some([0x3e, 0x7b, 0xfa])));
     }
 
     #[test]

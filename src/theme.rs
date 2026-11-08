@@ -103,7 +103,8 @@ impl Theme {
             2 => 24.0,
             3 => 20.0,
             4 => 18.0,
-            _ => BASE,
+            5 => BASE,
+            _ => 14.5,
         }
     }
 
@@ -136,6 +137,9 @@ impl Theme {
         if s.html {
             f.color = self.html;
             f.font_id = FontId::monospace(MONO);
+        }
+        if let Some([r, g, b]) = s.color {
+            f.color = Color32::from_rgb(r, g, b);
         }
         if s.link.is_some() {
             f.color = self.accent;

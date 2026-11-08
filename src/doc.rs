@@ -132,9 +132,21 @@ impl Doc {
 
     // -- Formatting commands --------------------------------------------------
 
+    /// The selection for inline formatting: never starting inside a line's
+    /// block prefix (`## `, `- `, `> `), which must stay at the line start.
+    fn inline_range(&self) -> Range<usize> {
+        let r = self.sel.range();
+        let ls = self.text[..r.start].rfind('\n').map_or(0, |i| i + 1);
+        let le = self.text[ls..].find('\n').map_or(self.text.len(), |i| ls + i);
+        let line = &self.text[ls..le];
+        let content = ls + (line.len() - strip_block_prefix(line).len());
+        let start = r.start.max(content).min(r.end.max(content));
+        start..r.end.max(start)
+    }
+
     /// Toggle an inline wrapper like `**`, `*`, `~~`, `` ` ``.
     pub fn toggle_wrap(&mut self, mark: &str) {
-        let r = self.sel.range();
+        let r = self.inline_range();
         let m = mark.len();
         let t = &self.text;
 
@@ -158,14 +170,189 @@ impl Doc {
         self.replace(r, &wrapped, sel, false);
     }
 
-    pub fn insert_link(&mut self) {
+    /// Turn the selection into a link to `url`, or insert a new link (using
+    /// `text`, or the URL itself, as its text) at the caret.
+    pub fn wrap_link(&mut self, url: &str, text: &str) {
         let r = self.sel.range();
-        let label = self.text[r.clone()].to_owned();
-        let label = if label.is_empty() { "link".to_owned() } else { label };
-        let s = format!("[{label}](https://)");
-        let url_start = r.start + label.len() + 3;
-        let sel = Sel { anchor: url_start, head: url_start + "https://".len() };
-        self.replace(r, &s, sel, false);
+        let label = if !r.is_empty() {
+            self.text[r.clone()].to_owned()
+        } else if text.is_empty() {
+            crate::ops::escape_inline(url.trim_matches(['<', '>']), false)
+        } else {
+            crate::ops::escape_inline(text, false)
+        };
+        let s = format!("[{label}]({url})");
+        let caret = r.start + s.len();
+        self.replace(r, &s, Sel::caret(caret), false);
+    }
+
+    /// Color the selected text (`Some("#hex")`) or remove its color (`None`).
+    /// Stored as `<span style="color: …">`; recoloring part of a colored run
+    /// splits that span so tags never nest or overlap.
+    pub fn set_color(&mut self, color: Option<&str>) {
+        let r = self.inline_range();
+        if r.is_empty() {
+            return;
+        }
+        let cs = crate::ops::containers(&self.text);
+        let wrap = |b: &str| match color {
+            Some(h) => (format!("{}{b}</span>", crate::markdown::color_open_tag(h)), crate::markdown::color_open_tag(h).len()),
+            None => (b.to_owned(), 0),
+        };
+
+        // Selection inside an existing color span: split it around the selection.
+        let around = cs
+            .iter()
+            .filter(|c| c.html && c.open.end <= r.start && r.end <= c.close.start)
+            .max_by_key(|c| c.open.start);
+        if let Some(sp) = around {
+            let t = &self.text;
+            let (o, k) = (&t[sp.open.clone()], &t[sp.close.clone()]);
+            let (a, b, c) = (&t[sp.open.end..r.start], &t[r.clone()], &t[r.end..sp.close.start]);
+            let mut out = String::new();
+            if !a.is_empty() {
+                out.push_str(&format!("{o}{a}{k}"));
+            }
+            let (inner, lead) = wrap(b);
+            let sel_start = sp.open.start + out.len() + lead;
+            out.push_str(&inner);
+            if !c.is_empty() {
+                out.push_str(&format!("{o}{c}{k}"));
+            }
+            let sel = Sel { anchor: sel_start, head: sel_start + b.len() };
+            return self.replace(sp.open.start..sp.close.end, &out, sel, false);
+        }
+
+        // Otherwise drop color spans fully inside the selection, then wrap.
+        let mut drop: Vec<std::ops::Range<usize>> = cs
+            .iter()
+            .filter(|c| c.html && r.start <= c.open.start && c.close.end <= r.end)
+            .flat_map(|c| [c.open.clone(), c.close.clone()])
+            .collect();
+        drop.sort_by_key(|d| d.start);
+        let mut body = String::new();
+        let mut pos = r.start;
+        for d in &drop {
+            body.push_str(&self.text[pos..d.start]);
+            pos = d.end;
+        }
+        body.push_str(&self.text[pos..r.end]);
+        let (out, lead) = wrap(&body);
+        let sel = Sel { anchor: r.start + lead, head: r.start + lead + body.len() };
+        self.replace(r, &out, sel, false);
+    }
+
+    /// Remove inline formatting (bold, italic, strikethrough, code, color)
+    /// from the selection. Formatting that only partly overlaps it is split,
+    /// so text outside the selection keeps its formatting. Links stay.
+    pub fn clear_formatting(&mut self) {
+        let r = self.inline_range();
+        if r.is_empty() {
+            return;
+        }
+        let (s, e) = (r.start, r.end);
+        let cs = crate::ops::containers(&self.text);
+        // Edits as (range to replace, insertion); applied together below.
+        let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+        let mut enclosing: Vec<&crate::ops::Container> = Vec::new();
+        for c in &cs {
+            let is_link = self.text[c.open.clone()].starts_with(['[', '<']) && !c.html;
+            if is_link || c.close.end <= s || e <= c.open.start {
+                continue;
+            }
+            let open_in = s <= c.open.start && c.open.end <= e;
+            let close_in = s <= c.close.start && c.close.end <= e;
+            let (open_t, close_t) = (self.text[c.open.clone()].to_owned(), self.text[c.close.clone()].to_owned());
+            match (open_in, close_in) {
+                (true, true) => {
+                    edits.push((c.open.clone(), String::new()));
+                    edits.push((c.close.clone(), String::new()));
+                }
+                (true, false) => {
+                    // Starts inside the selection: move the opening marker to its end.
+                    edits.push((c.open.clone(), String::new()));
+                    edits.push((e..e, open_t));
+                }
+                (false, true) => {
+                    edits.push((c.close.clone(), String::new()));
+                    edits.push((s..s, close_t));
+                }
+                (false, false) if c.open.end <= s && e <= c.close.start => enclosing.push(c),
+                _ => {}
+            }
+        }
+        // Formatting around the whole selection: close before it, reopen after.
+        enclosing.sort_by_key(|c| c.open.start);
+        for c in enclosing.iter().rev() {
+            let (open_t, close_t) = (self.text[c.open.clone()].to_owned(), self.text[c.close.clone()].to_owned());
+            match (c.open.end == s, c.close.start == e) {
+                (true, true) => {
+                    edits.push((c.open.clone(), String::new()));
+                    edits.push((c.close.clone(), String::new()));
+                }
+                (true, false) => {
+                    edits.push((c.open.clone(), String::new()));
+                    edits.push((e..e, open_t));
+                }
+                (false, true) => {
+                    edits.push((c.close.clone(), String::new()));
+                    edits.push((s..s, close_t));
+                }
+                (false, false) => {
+                    edits.push((s..s, close_t));
+                    edits.push((e..e, open_t));
+                }
+            }
+        }
+        if edits.is_empty() {
+            return;
+        }
+        // Markdown markers must hug text: a closing marker can't follow a
+        // space and an opening one can't precede one. So inserted closers at
+        // `s` move left past spaces, inserted openers at `e` move right.
+        let t = &self.text;
+        let ws_left = t[..s].len() - t[..s].trim_end_matches([' ', '\t']).len();
+        let ws_right = t[e..].len() - t[e..].trim_start_matches([' ', '\t']).len();
+        for (r, _) in edits.iter_mut().filter(|(r, _)| r.is_empty()) {
+            if r.start == s {
+                *r = s - ws_left..s - ws_left;
+            } else if r.start == e {
+                *r = e + ws_right..e + ws_right;
+            }
+        }
+        // Stable sort: insertions at the same point keep their push order
+        // (closing markers innermost-first, opening markers outermost-first).
+        edits.sort_by_key(|(r, _)| r.start);
+        let lo = edits.iter().map(|(r, _)| r.start).min().unwrap_or(s);
+        let hi = edits.iter().map(|(r, _)| r.end).max().unwrap_or(e);
+        let mut out = String::new();
+        let mut pos = lo;
+        for (r, ins) in &edits {
+            out.push_str(&self.text[pos..r.start]);
+            out.push_str(ins);
+            pos = r.end;
+        }
+        out.push_str(&self.text[pos..hi]);
+
+        // New position of old offset `p`. Markers inserted exactly at `p`
+        // count as before it when `inserts_before` (selection start).
+        let map = |p: usize, inserts_before: bool| -> usize {
+            let mut q = p as isize;
+            for (r, ins) in &edits {
+                if r.is_empty() {
+                    if r.start < p || (r.start == p && inserts_before) {
+                        q += ins.len() as isize;
+                    }
+                } else if r.end <= p {
+                    q -= r.len() as isize;
+                } else if r.start < p {
+                    q -= (p - r.start) as isize;
+                }
+            }
+            q as usize
+        };
+        let sel = Sel { anchor: map(s, true), head: map(e, false) };
+        self.replace(lo..hi, &out, sel, false);
     }
 
     /// Byte range of the full lines touched by the selection.
@@ -184,7 +371,11 @@ impl Doc {
         let sel = if self.sel.is_empty() {
             Sel::caret(span.start + new.len())
         } else {
-            Sel { anchor: span.start, head: span.start + new.len() }
+            // Select the text, not the `## ` / `- ` prefix: a following inline
+            // command (e.g. italic) must not wrap the prefix.
+            let first = new.split('\n').next().unwrap_or("");
+            let prefix = first.len() - strip_block_prefix(first).len();
+            Sel { anchor: span.start + prefix, head: span.start + new.len() }
         };
         self.replace(span, &new, sel, false);
     }
@@ -261,7 +452,7 @@ impl Doc {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Prefix {
     Bullet,
     Number,
@@ -373,6 +564,80 @@ mod tests {
         let mut d = doc("", 0, 0);
         d.insert_block("x");
         assert_eq!(d.text, "x");
+    }
+
+    #[test]
+    fn links() {
+        let mut d = doc("see docs here", 4, 8);
+        d.wrap_link("https://x.org", "");
+        assert_eq!(d.text, "see [docs](https://x.org) here");
+        let mut d = doc("", 0, 0);
+        d.wrap_link("https://x.org", "a*b");
+        assert_eq!(d.text, "[a\\*b](https://x.org)");
+    }
+
+    #[test]
+    fn colors() {
+        let red = "#e5484d";
+        let open = crate::markdown::color_open_tag(red);
+        let mut d = doc("one two three", 4, 7);
+        d.set_color(Some(red));
+        assert_eq!(d.text, format!("one {open}two</span> three"));
+        assert_eq!(&d.text[d.sel.range()], "two");
+
+        // Recolor part of the run: the span splits.
+        let blue = "#3e7bfa";
+        let mut d = doc(&format!("{open}abc</span>"), open.len() + 1, open.len() + 2);
+        d.set_color(Some(blue));
+        let b = crate::markdown::color_open_tag(blue);
+        assert_eq!(d.text, format!("{open}a</span>{b}b</span>{open}c</span>"));
+
+        // Remove color from the whole run.
+        let mut d = doc(&format!("x {open}abc</span> y"), 2 + open.len(), 2 + open.len() + 3);
+        d.set_color(None);
+        assert_eq!(d.text, "x abc y");
+    }
+
+    #[test]
+    fn clear_formatting() {
+        let check = |src: &str, sel: &str, want: &str| {
+            let a = src.find(sel).unwrap();
+            let mut d = doc(src, a, a + sel.len());
+            d.clear_formatting();
+            assert_eq!(d.text, want, "clearing {sel:?} in {src:?}");
+            assert_eq!(&d.text[d.sel.range()], sel.replace(['*', '~', '`'], "").as_str());
+        };
+        check("a **bold** b", "**bold**", "a bold b");
+        check("**one two three**", "two", "**one** two **three**");
+        check("x *ab*cd y", "b*c", "x *a*bcd y");
+        check("**ab**", "a", "a**b**");
+        check("[**link**](u)", "**link**", "[link](u)");
+        let red = crate::markdown::color_open_tag("#e5484d");
+        let src = format!("{red}one two</span>");
+        let a = src.find("two").unwrap();
+        let mut d = doc(&src, a, a + 3);
+        d.clear_formatting();
+        assert_eq!(d.text, format!("{red}one</span> two"));
+    }
+
+    #[test]
+    fn block_change_selects_text_not_prefix() {
+        let mut d = doc("Features", 0, 8);
+        d.set_heading(2);
+        assert_eq!(&d.text[d.sel.range()], "Features");
+        d.toggle_wrap("*");
+        assert_eq!(d.text, "## *Features*");
+    }
+
+    #[test]
+    fn inline_formats_skip_block_prefix() {
+        // Selection starting at the line start, before "## ".
+        let mut d = doc("## Features", 0, 11);
+        d.toggle_wrap("*");
+        assert_eq!(d.text, "## *Features*");
+        let mut d = doc("- item", 0, 6);
+        d.toggle_wrap("**");
+        assert_eq!(d.text, "- **item**");
     }
 
     #[test]

@@ -21,14 +21,16 @@
 
 ## Features
 
-- **Edit in place.** Everything stays rendered; the block under your caret reveals its markdown syntax, dimmed, so you can edit it (like Typora or Obsidian's live preview).
-- **Source view.** One click (or `Ctrl+/`) shows the raw markdown, syntax-highlighted. The caret stays where it was.
+- **Edit like a normal document.** The editor shows formatted text only, never markdown syntax. Format with the toolbar or shortcuts, and select text across paragraphs, lists and headings. Typing `- `, `1. `, `# ` or `> ` at the start of a line turns it into a list, heading or quote.
+- **Floating toolbar.** Select text and a small toolbar appears above it. It has a block-type menu (text, headings 1–6, lists, quote) plus bold, italic, strikethrough, code, link, text color and clear formatting.
+- **Text color and clear formatting.** Pick from 8 colors that read well in both themes, or strip all inline formatting from a selection in one click (links are kept).
+- **Source view.** One click (or `Ctrl+/`) shows the raw markdown, syntax-highlighted, for anyone who'd rather write markdown directly. The caret stays where it was.
 - **Your file stays yours.** MDV only stores the markdown text, so it never reformats or rewrites what you wrote.
 - **Smart editing.** Lists and task lists continue on Enter, checkboxes toggle with a click, and there are toolbar buttons and shortcuts for all common formatting.
 - **Images.** Local files (relative to the document) and web images, including PNG, JPEG, GIF, WebP and SVG. Insert one from the toolbar (paste a link or browse), or drop an image file onto the window. Click an image to select it, then drag a corner handle to resize it.
 - **Find and replace.** `Ctrl+F` / `Ctrl+H`, with match-case, replace one or replace all. Matches are highlighted in both views.
 - **Light.** Built with [egui](https://github.com/emilk/egui) on OpenGL. It only redraws when you do something, so it uses 0% CPU when idle. The binary is about 14 MB.
-- **Native feel.** Uses your desktop's fonts and native file dialogs, with dark and light themes.
+- **Native feel.** Uses your desktop's fonts and native file dialogs, with dark and light themes. The toolbar rearranges itself to fit narrow windows.
 
 Linux first (Wayland and X11). Windows and macOS builds are produced too; there, MDV uses its built-in font instead of the system one (font discovery uses `fc-match`, see `src/fonts.rs`).
 
@@ -71,8 +73,8 @@ Pushing a version tag builds everything on GitHub Actions ([.github/workflows/re
 
 ```sh
 # 1. bump `version` in Cargo.toml, commit
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 | Platform | Artifact | Built on |
@@ -101,6 +103,16 @@ Click an image to select it. Then drag a corner handle to resize it, press `Dele
 
 Web (`https://`) images are downloaded when the document opens, like in any markdown viewer.
 
+## Text color
+
+Markdown has no syntax for color, so MDV stores colored text as an HTML tag:
+
+```html
+<span style="color: #e5484d">important</span>
+```
+
+MDV, VS Code, Obsidian and Typora show the color. **GitHub doesn't**: it removes inline styles for safety, so on GitHub the text appears in the normal color (still readable, nothing breaks).
+
 ## How it works
 
 **The markdown text is the only stored copy of the document.** Nothing is converted into a rich-text tree and back, so files are never rewritten behind your back, and switching between views loses nothing.
@@ -111,14 +123,19 @@ Web (`https://`) images are downloaded when the document opens, like in any mark
 | `src/markdown.rs` | `pulldown-cmark` → top-level blocks with source offsets; style runs for syntax highlighting |
 | `src/images.rs` | Parsing `<img>` tags, resolving image paths, writing image markdown |
 | `src/find.rs` | Find & replace (search, highlights, the find bar) |
-| `src/editor.rs` | `LiveEditor` (rendered blocks + inline editing) and `SourceEditor` (full highlighted source) |
+| `src/live.rs` | The WYSIWYG editor: rendering, caret/selection, keyboard and mouse editing |
+| `src/ops.rs` | Source rules behind editing: escaping, keeping `**`/links balanced on delete and Enter |
+| `src/editor.rs` | The Source view, plus helpers shared by both views |
 | `src/theme.rs` | Dark/light palettes, text formats |
 | `src/fonts.rs` | Uses the desktop's sans/mono fonts via fontconfig; Phosphor icons |
 | `src/app.rs` | Window, toolbar, shortcuts, open/save dialogs (XDG portal), unsaved-changes prompt |
 | `packaging/` | AppImage build, Linux user install, macOS `Info.plist` |
 | `.github/workflows/` | CI (lint + tests) and release builds |
 
-**Editor view:** every block is drawn rendered. The block with the caret becomes an inline text editor that shows its markdown syntax dimmed (like Typora or Obsidian's live preview). Clicking rendered text maps the click back to the exact source position. Keys that cross block boundaries (Enter, Backspace/Delete at edges, arrows at the first/last line) are handled in `LiveEditor::handle_keys` before egui's TextEdit sees them.
+**Editor view** (`src/live.rs`): everything is drawn formatted, and every visible character knows the byte range of markdown source it came from. Caret moves, selection, typing and deleting happen on the visible text and are translated into source edits. `src/ops.rs` keeps the markup valid while doing that:
+- Typed characters that mean something in markdown (`*`, `_`, `[` …) are escaped, so they stay literal.
+- Deleting all of a bold word removes its `**` markers too, instead of leaving `****` behind.
+- Pressing Enter inside bold or a link closes the formatting before the break and reopens it after.
 
 **Source view:** the same `Doc`, shown as monospace highlighted text. The selection is shared, so the caret stays put when you switch.
 
@@ -127,15 +144,17 @@ Web (`https://`) images are downloaded when the document opens, like in any mark
 | Keys | Action |
 |---|---|
 | `Ctrl+/` | Toggle editor ↔ source |
-| `Ctrl+B` / `Ctrl+I` / `Ctrl+Shift+X` / `Ctrl+E` | Bold / italic / strikethrough / inline code |
-| `Ctrl+K` | Link |
-| `Ctrl+0…3` | Paragraph / heading level |
+| `Ctrl+B` / `Ctrl+I` / `Ctrl+Shift+X` / `Ctrl+E` | Bold / italic / strikethrough / inline code (with nothing selected: applies to what you type next) |
+| `Ctrl+K` | Insert link (asks for the URL) |
+| `Ctrl+\` | Clear formatting |
+| `Ctrl+0…6` | Paragraph / heading level 1–6 |
 | `Ctrl+Z`, `Ctrl+Shift+Z` / `Ctrl+Y` | Undo, redo |
 | `Ctrl+N` / `Ctrl+O` / `Ctrl+S` / `Ctrl+Shift+S` | New / open / save / save as |
 | `Ctrl+F` / `Ctrl+H` | Find / find and replace |
 | `Enter` / `Shift+Enter` (in find) or `F3` / `Shift+F3` | Next / previous match |
 | `Ctrl+click` | Open a link |
 | `Delete` (image selected) | Remove the image |
+| `Shift+Enter` | Line break within a paragraph |
 | `Esc` | Stop editing / deselect image / close find |
 
 ## Tests
@@ -148,7 +167,8 @@ Includes headless UI tests (`egui_kittest`) that click and type into the live ed
 
 ## Known limitations / next steps
 
-- Selection can't span several blocks in the editor view (use the source view for that).
+- Markdown has no empty paragraphs, so pressing Enter twice doesn't leave a blank line.
+- Empty table cells can't be typed into from the editor yet (use the Source view).
 - Images inside a line of text (like badges) are shown after that line rather than inline.
 - Pasting an image from the clipboard isn't supported yet; save it as a file and insert or drop it.
 - Find matches the markdown source, so a search can't span formatting markers (`**bold**`).

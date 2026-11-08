@@ -905,6 +905,7 @@ version = "0.36.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5eb3f3effb2726fee23449293e67acbf6cc6ce35525b1722bd5743bb348114d5"
 dependencies = [
+ "eframe",
  "egui",
  "kittest",
  "log",
@@ -1827,7 +1828,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "mdv"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "egui-phosphor",
