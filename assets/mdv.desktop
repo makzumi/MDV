@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=MDV
+GenericName=Markdown Editor
+Comment=Light, fast markdown viewer and editor
+Exec=mdv %f
+Icon=mdv
+Terminal=false
+Categories=Utility;TextEditor;
+MimeType=text/markdown;text/x-markdown;
+StartupWMClass=mdv

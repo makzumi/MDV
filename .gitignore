@@ -1,0 +1,26 @@
+# Build output
+/target
+/dist
+*.AppImage
+
+# Local env / secrets (never commit)
+.env
+.env.*
+
+# Editors & IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS clutter
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Personal Claude Code settings (shared .claude/settings.json is fine to commit)
+.claude/settings.local.json
+
+# Note: Cargo.lock is intentionally tracked — this is an application, and
+# `--locked` builds in CI rely on it.

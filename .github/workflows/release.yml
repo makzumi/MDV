@@ -1,0 +1,132 @@
+# Builds MDV for Linux (AppImage), Windows (.exe) and macOS (.dmg, universal)
+# and attaches them to a *draft* GitHub Release.
+#
+# Trigger: push a tag like v0.1.0 (must match `version` in Cargo.toml).
+# Run manually from the Actions tab to just build the artifacts (no release).
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$VERSION" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: version
+    # Oldest supported Ubuntu = widest glibc compatibility for the AppImage.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - run: ./packaging/linux/build-appimage.sh "${{ needs.version.outputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*.AppImage
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/mdv.exe "dist/MDV-${{ needs.version.outputs.version }}-windows-x86_64.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.exe
+
+  macos:
+    needs: version
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      VERSION: ${{ needs.version.outputs.version }}
+      BUNDLE_ID: io.github.${{ github.repository_owner }}.mdv
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (Apple Silicon + Intel)
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Make universal MDV.app
+        run: |
+          APP=dist/MDV.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          lipo -create -output "$APP/Contents/MacOS/mdv" \
+            target/aarch64-apple-darwin/release/mdv \
+            target/x86_64-apple-darwin/release/mdv
+          sed -e "s/@VERSION@/$VERSION/g" -e "s/@BUNDLE_ID@/$BUNDLE_ID/g" \
+            packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+
+          ICONSET=dist/mdv.iconset
+          mkdir -p "$ICONSET"
+          for s in 16 32 128 256 512; do
+            sips -z $s $s assets/icon-1024.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+            sips -z $((s*2)) $((s*2)) assets/icon-1024.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+          done
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/mdv.icns"
+
+          # Ad-hoc signature (not notarized): required for the app to launch on Apple Silicon.
+          codesign --force --deep --sign - "$APP"
+      - name: Make .dmg
+        run: |
+          mkdir -p dist/dmg
+          cp -R dist/MDV.app dist/dmg/
+          ln -s /Applications dist/dmg/Applications
+          hdiutil create -volname MDV -srcfolder dist/dmg -ov -format UDZO \
+            "dist/MDV-$VERSION-macos-universal.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.dmg
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [version, linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: (cd dist && sha256sum * > SHA256SUMS.txt)
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: dist/*
